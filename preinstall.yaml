@@ -1,0 +1,242 @@
+---
+# tasks file for kubernetes_cluster
+  
+  - name: Update & Upgrade YUM Packages
+    yum:
+      name: "*"
+      state: latest
+    tags: preinstall
+
+  - name: Stop & Disable FirewallD
+    systemd:
+      name: firewalld
+      state: stopped
+      enabled: no
+    when: ansible_facts.services['firewalld.service'] is defined and ansible_facts.services['firewalld.service'].state != 'stopped'
+    tags: preinstall
+
+  - name: Disable SELinux (runtime)
+    command: setenforce 0
+    ignore_errors: yes
+    tags: preinstall
+
+  - name: Disable SELinux permanently
+    lineinfile:
+      path: /etc/selinux/config
+      regexp: '^SELINUX='
+      line: 'SELINUX=disabled'
+    tags: preinstall
+
+  - name: Install Sezer's most favorite packages
+    yum:
+      name:
+        - whois 
+        - curl
+        - zip
+        - unzip
+        - wget 
+        - net-tools
+        - vim
+        - nano
+        - telnet
+        - bash-completion
+        - bash-completion*
+        - git
+        - bind-utils
+        - gcc
+        - make
+        - perl 
+        - sysstat
+        - bzip2
+        - traceroute
+        - gnupg2
+        - ca-certificates
+        - 'dnf-command(versionlock)'
+      state: present
+    tags: preinstall
+
+  - name: Add k8s hosts to /etc/hosts
+    lineinfile:
+      path: /etc/hosts
+      line: "{{ item }} {{ hostvars[item]['ansible_host'] }}"
+      state: present
+      create: yes
+    loop: "{{ groups['preinstall'] }}"
+    tags: preinstall
+
+#   - name: reboot and wait for reboot to complete
+#     reboot:
+
+  - name: disable SWAP (Kubeadm requirement)
+    shell: |
+      swapoff -a
+    tags: preinstall
+
+  - name: disable SWAP in fstab (Kubeadm requirement)
+    lineinfile:
+      path: /etc/fstab
+      regex: '^/dev/mapper/rhel-swap.*'
+      line: '# /dev/mapper/rhel-swap'
+    tags: preinstall
+
+  - name: create an empty file for the Containerd module
+    copy:
+      content: ""
+      dest: /etc/modules-load.d/containerd.conf
+      force: no
+    tags: preinstall
+
+  - name: configure modules for Containerd
+    blockinfile:
+      path: /etc/modules-load.d/containerd.conf
+      block: |
+           overlay
+           br_netfilter
+    tags: preinstall
+
+  - name: create an empty file for Kubernetes sysctl params
+    copy:
+      content: ""
+      dest: /etc/sysctl.d/99-kubernetes-cri.conf
+      force: no
+    tags: preinstall
+
+  - name: configure sysctl params for Kubernetes
+    lineinfile:
+      path: /etc/sysctl.d/99-kubernetes-cri.conf
+      line: "{{ item }}"
+    with_items:
+      - 'net.bridge.bridge-nf-call-iptables  = 1'
+      - 'net.ipv4.ip_forward                 = 1'
+      - 'net.bridge.bridge-nf-call-ip6tables = 1'
+    tags: preinstall
+
+  - name: apply sysctl params without reboot
+    command: sysctl --system
+    tags: preinstall
+
+  - name: Add Docker Repo
+    shell: |
+      yum config-manager --add-repo=https://download.docker.com/linux/centos/docker-ce.repo
+    args:
+      executable: /bin/bash
+    tags: preinstall
+
+  - name: Add K8s Repo
+    shell: |
+      cat <<EOF | sudo tee /etc/yum.repos.d/kubernetes.repo
+      [kubernetes]
+      name=Kubernetes
+      baseurl=https://pkgs.k8s.io/core:/stable:/v1.33/rpm/
+      enabled=1
+      gpgcheck=1
+      gpgkey=https://pkgs.k8s.io/core:/stable:/v1.33/rpm/repodata/repomd.xml.key
+      EOF
+    args:
+      executable: /bin/bash
+    tags: preinstall
+  
+  - name: install Containerd
+    yum:
+      name: containerd
+      state: present
+    tags: preinstall
+  
+  - name: create Containerd directory
+    file:
+      path: /etc/containerd
+      state: directory
+    tags: preinstall
+
+  - name: add Containerd configuration
+    shell: /usr/bin/containerd config default > /etc/containerd/config.toml
+    tags: preinstall
+
+  - name: configuring the systemd cgroup driver for Containerd
+    lineinfile:
+      path: /etc/containerd/config.toml
+      regexp: '            SystemdCgroup = false'
+      line: '            SystemdCgroup = true'
+    tags: preinstall
+
+  - name: configuring the systemd cgroup driver for Containerd
+    lineinfile:
+      path: /etc/containerd/config.toml
+      regexp: '^(\s*\[plugins\."io\.containerd\.grpc\.v1\.cri"\])'
+      line: '    plugins.cri.systemd_cgroup = false'
+      backrefs: yes
+    tags: preinstall
+
+  - name: enable the Containerd service and start it
+    systemd:
+      name: containerd
+      state: restarted
+      enabled: yes
+      daemon-reload: yes
+    tags: preinstall
+
+  - name: Install Kubernetes packages
+    yum:
+      name: "{{ item }}"
+      state: present
+    loop:
+      - kubelet
+      - kubeadm
+      - kubectl
+    tags: preinstall
+
+  - name: enable the Kubelet service, and enable it persistently
+    service:
+      name: kubelet
+      enabled: yes
+    tags: preinstall
+
+  - name: Load br_netfilter kernel module
+    command: modprobe br_netfilter
+    tags: preinstall
+
+  - name: Enable bridge-nf-call-iptables at runtime
+    command: sysctl -w net.bridge.bridge-nf-call-iptables=1
+    tags: preinstall
+
+  - name: Persist bridge-nf-call-iptables setting
+    lineinfile:
+      path: /etc/sysctl.conf
+      regexp: '^net.bridge.bridge-nf-call-iptables'
+      line: 'net.bridge.bridge-nf-call-iptables = 1'
+      state: present
+    tags: preinstall
+
+  - name: Reload sysctl
+    command: sysctl -p
+    tags: preinstall
+
+  - name: set ip_forward
+    sysctl:
+      name: net.ipv4.ip_forward
+      value: 1
+    tags: preinstall
+
+  - name: check Kubelet args in Kubelet config
+    shell: grep "^Environment=\"KUBELET_EXTRA_ARGS=" /usr/lib/systemd/system/kubelet.service || true
+    register: check_args
+    tags: preinstall
+
+  - name: add runtime args in Kubelet config
+    lineinfile:
+      dest: "/usr/lib/systemd/system/kubelet.service"
+      line: "Environment=\"KUBELET_EXTRA_ARGS= --runtime-cgroups=/system.slice/containerd.service --container-runtime-endpoint=unix:///run/containerd/containerd.sock\""
+      insertafter: '\[Service\]'
+    when: check_args.stdout == ""
+    tags: preinstall
+
+  - name: Hold packages
+    vars:
+      package_list:
+        - kubeadm
+        - containerd
+        - kubelet
+        - kubectl
+    command: "yum versionlock add {{ item }}"
+    loop: "{{ package_list }}"
+    tags: preinstall
